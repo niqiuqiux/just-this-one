@@ -8,8 +8,11 @@ import {
   MoveUpRight, Plus, RotateCcw, Search, ShieldCheck, SlidersHorizontal, Sparkles,
   Sun, Trash2, X,
 } from 'lucide-react'
-import { CATEGORIES, STORAGE_KEY, isEntry, loadStore, randomIndex, relativeTime } from './model'
+import { CATEGORIES, isEntry, randomIndex, relativeTime } from './model'
 import type { Category, Entry, Page, Store } from './model'
+import { useWorkspace } from './sync/useWorkspace'
+import { SyncPanel, syncLabel } from './sync/SyncPanel'
+import { mergeWorkspaces } from './sync/merge'
 
 const categoryIcons = { 灵感: Lightbulb, 工作: FolderHeart, 生活: Coffee, 学习: BookOpen }
 const pageLabels: Record<Page, string> = { notes: '随心记', draw: '摇个任务', done: '已完成' }
@@ -86,10 +89,11 @@ function Modal({ children, title, onClose, drawer = false }: { children: ReactNo
   </dialog>
 }
 
-function EntryEditor({ entry, onSave, onDelete, onClose }: { entry: Entry; onSave: (entry: Entry) => void; onDelete: (entry: Entry) => void; onClose: () => void }) {
+function EntryEditor({ entry, onSave, onDelete, onClose }: { entry: Entry; onSave: (entry: Entry, original: Entry) => void; onDelete: (entry: Entry) => void; onClose: () => void }) {
+  const [original] = useState(entry)
   const [draft, setDraft] = useState(entry)
   return <Modal title="这一刻的想法" onClose={onClose} drawer>
-    <form className="entry-form" onSubmit={e => { e.preventDefault(); if (draft.title.trim()) { onSave({ ...draft, title: draft.title.trim(), example: false }); onClose() } }}>
+    <form className="entry-form" onSubmit={e => { e.preventDefault(); if (draft.title.trim()) { onSave({ ...draft, title: draft.title.trim(), example: false }, original); onClose() } }}>
       <label className="field-label" htmlFor="entry-title">一句话，记住它</label>
       <input id="entry-title" autoFocus className="editor-title" value={draft.title} maxLength={120} required onChange={e => setDraft({ ...draft, title: e.target.value })} />
       <label className="field-label" htmlFor="entry-body">再展开说说</label>
@@ -234,16 +238,15 @@ function DrawStage({ candidates, active, onAccept, onComplete, onRelease, compac
 }
 
 export default function App() {
-  const [initial] = useState(loadStore)
-  const [store, setStore] = useState<Store>(initial.store)
-  const [storageError, setStorageError] = useState<string | null>(initial.error)
+  const sync = useWorkspace()
+  const { store, setStore, storageError } = sync
   const [page, setPage] = useState<Page>('notes')
   const [category, setCategory] = useState<Category | '全部'>('全部')
   const [query, setQuery] = useState('')
   const [notesFilter, setNotesFilter] = useState<'all' | 'tasks' | 'ideas'>('all')
   const [timeFilter, setTimeFilter] = useState(0)
   const [excluded, setExcluded] = useState<string[]>([])
-  const [editor, setEditor] = useState<string | null>(null)
+  const [editor, setEditor] = useState<Entry | null>(null)
   const [dataModal, setDataModal] = useState(false)
   const [helpModal, setHelpModal] = useState(false)
   const [newId, setNewId] = useState<string | null>(null)
@@ -255,12 +258,8 @@ export default function App() {
   const notify = useCallback((message: string, undo?: () => void) => setToast({ message, undo, id: Date.now() }), [])
   const closeToast = useCallback(() => setToast(null), [])
 
-  useEffect(() => {
-    if (initial.error) return
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); setStorageError(null) }
-    catch { setStorageError('本地保存失败，请导出备份后检查浏览器存储空间。') }
-  }, [store, initial.error])
   useEffect(() => () => clearTimeout(newTimer.current), [])
+  useEffect(() => { setEditor(null); setExcluded([]); setToast(null) }, [sync.user?.id])
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
       if (document.querySelector('dialog[open]')) return
@@ -283,7 +282,7 @@ export default function App() {
     && (category === '全部' || e.category === category)
     && (notesFilter === 'all' || (notesFilter === 'tasks' ? e.isTask : !e.isTask))
     && (!query || `${e.title} ${e.body}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())))
-  const selectedEntry = store.entries.find(e => e.id === editor)
+  const selectedEntry = editor
 
   function navigate(next: Page) { setPage(next); setQuery(''); setCategory('全部'); setNotesFilter('all'); window.scrollTo({ top: 0, behavior: 'instant' }) }
   function add(entry: Entry) {
@@ -293,18 +292,28 @@ export default function App() {
     notify(entry.isTask ? '想法已记下，也加入了任务池。' : '这一刻的想法，留住了。')
     clearTimeout(newTimer.current); newTimer.current = setTimeout(() => setNewId(null), 1800)
   }
-  function update(entry: Entry) { setStore(s => ({ ...s, entries: s.entries.map(e => e.id === entry.id ? entry : e), activeId: !entry.isTask && s.activeId === entry.id ? null : s.activeId })); notify('已经保存，灵感还在。') }
+  function update(entry: Entry, original: Entry) {
+    let conflicts = 0
+    setStore(s => {
+      const current = s.entries.find(e => e.id === entry.id)
+      if (current === original || original.example) return { ...s, entries: s.entries.map(e => e.id === entry.id ? entry : e), activeId: !entry.isTask && s.activeId === entry.id ? null : s.activeId }
+      const merged = mergeWorkspaces({ entries: [original], activeId: s.activeId }, { entries: [entry], activeId: s.activeId }, { entries: current ? [current] : [], activeId: s.activeId })
+      conflicts = merged.conflicts
+      return { ...s, entries: [...s.entries.filter(e => e.id !== entry.id), ...merged.data.entries], activeId: !entry.isTask && s.activeId === entry.id ? null : s.activeId }
+    })
+    notify(conflicts ? '另一端也修改了这条记录，你的编辑已另存为同步副本。' : '已经保存，灵感还在。')
+  }
   function remove(entry: Entry) {
     transition(() => setStore(s => ({ ...s, entries: s.entries.filter(e => e.id !== entry.id), activeId: s.activeId === entry.id ? null : s.activeId })))
     notify('记录已删除。', () => transition(() => setStore(s => ({ ...s, entries: s.entries.some(e => e.id === entry.id) ? s.entries : [entry, ...s.entries] }))))
   }
   function complete(entry: Entry) {
-    transition(() => setStore(s => ({ ...s, activeId: s.activeId === entry.id ? null : s.activeId, entries: s.entries.map(e => e.id === entry.id ? { ...e, done: true, completedAt: Date.now() } : e) })))
+    transition(() => setStore(s => ({ ...s, activeId: s.activeId === entry.id ? null : s.activeId, entries: s.entries.map(e => e.id === entry.id ? { ...e, example: false, done: true, completedAt: Date.now() } : e) })))
     notify('又完成了一件事，做得很好。', () => setStore(s => ({ ...s, entries: s.entries.map(e => e.id === entry.id ? { ...e, done: false, completedAt: undefined } : e) })))
   }
   function restore(entry: Entry) { transition(() => setStore(s => ({ ...s, entries: s.entries.map(e => e.id === entry.id ? { ...e, done: false, completedAt: undefined } : e) }))); notify('已放回任务池，准备再次出发。') }
   function toggleTask(entry: Entry) {
-    setStore(s => ({ ...s, activeId: s.activeId === entry.id ? null : s.activeId, entries: s.entries.map(e => e.id === entry.id ? { ...e, isTask: !e.isTask } : e) }))
+    setStore(s => ({ ...s, activeId: s.activeId === entry.id ? null : s.activeId, entries: s.entries.map(e => e.id === entry.id ? { ...e, example: false, isTask: !e.isTask } : e) }))
     notify(entry.isTask ? '已从任务池移出，想法仍然保留。' : '已加入任务池，等下一次遇见。')
   }
   function exportData() {
@@ -317,7 +326,7 @@ export default function App() {
     try {
       if (file.size > 10 * 1024 * 1024) throw new Error('too large')
       const parsed = JSON.parse(await file.text()) as Store
-      if (!Array.isArray(parsed.entries) || !parsed.entries.every(isEntry)) throw new Error('invalid')
+      if (!parsed || !Array.isArray(parsed.entries) || !parsed.entries.every(isEntry)) throw new Error('invalid')
       setStore(s => { const ids = new Set(s.entries.map(e => e.id)); const incoming = parsed.entries.filter(e => { if (ids.has(e.id)) return false; ids.add(e.id); return true }); return { ...s, welcomed: true, entries: [...incoming, ...s.entries] } })
       notify('备份已合并，现有记录也都保留了。')
     } catch { notify('无法导入，请选择从“就这件”导出的 JSON 备份文件。') }
@@ -338,19 +347,21 @@ export default function App() {
         <button className="sidebar-data" onClick={() => setDataModal(true)}><HardDrive size={16} /><span>使用与数据</span><ArrowUpRight size={13} /></button><div className="sidebar-footer"><span className="status-dot" />留一点空白，给下一次灵感。</div></div>
     </aside>
 
-    <div className="main-shell"><header className="topbar"><div className="breadcrumb"><span className="mobile-brand"><BrandMark small /></span><span>我的空间</span><span className="breadcrumb-slash">/</span><strong>{pageLabels[page]}</strong></div><div className="topbar-right"><div className="global-search"><Search size={15} /><input ref={searchRef} aria-label="搜索记录" placeholder="搜索记录…" value={query} onChange={e => { setQuery(e.target.value); if (page === 'draw') setPage('notes') }} /><kbd>⌘ K</kbd>{query && <button className="icon-button" aria-label="清空搜索" onClick={() => setQuery('')}><X size={13} /></button>}</div><button className={`save-status ${storageError ? 'error' : ''}`} onClick={() => setDataModal(true)}><span className="status-dot" />{storageError ? '本地保存异常' : '已保存在此设备'}</button><button className="avatar" aria-label="查看使用说明" onClick={() => setHelpModal(true)}>我</button></div></header>
+    <div className="main-shell"><header className="topbar"><div className="breadcrumb"><span className="mobile-brand"><BrandMark small /></span><span>我的空间</span><span className="breadcrumb-slash">/</span><strong>{pageLabels[page]}</strong></div><div className="topbar-right"><div className="global-search"><Search size={15} /><input ref={searchRef} aria-label="搜索记录" placeholder="搜索记录…" value={query} onChange={e => { setQuery(e.target.value); if (page === 'draw') setPage('notes') }} /><kbd>⌘ K</kbd>{query && <button className="icon-button" aria-label="清空搜索" onClick={() => setQuery('')}><X size={13} /></button>}</div><button className={`save-status ${storageError || sync.phase === 'error' || sync.phase === 'expired' ? 'error' : ''}`} onClick={() => setDataModal(true)}><span className="status-dot" />{storageError ? '本地保存异常' : syncLabel(sync)}</button><button className="avatar" aria-label="打开账号与数据" onClick={() => setDataModal(true)}>我</button></div></header>
 
-    <main id="main-content" className="main-content">
+    <main id="main-content" className="main-content" key={sync.user?.id ?? 'local'}>
       <div className="page-intro" key={page}><div><span className="eyebrow date-label">{new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())}<span className="tiny-divider" />让今天，轻一点。</span><h1>{page === 'notes' ? '想到了，就记下来。' : page === 'draw' ? '下一件事，让随机来选。' : '每一小步，都算数。'}</h1><p>{page === 'notes' ? '收好一闪而过的灵感，也留住那些想做的小事。' : page === 'draw' ? '把选择交给一叠卡片，把注意力留给眼前这一件事。' : '这些被你完成的小事，拼出了认真生活的模样。'}</p></div><button className="button secondary page-action" onClick={() => { if (page === 'notes') navigate('draw'); else { navigate('notes'); setTimeout(() => composerRef.current?.focus(), 0) } }}>{page === 'notes' ? <><Dices size={16} />摇个任务<ArrowUpRight size={15} /></> : <><Plus size={16} />记个新想法</>}</button></div>
 
       {storageError && <div className="storage-warning" role="alert"><HardDrive size={16} /><span>{storageError}</span><button onClick={exportData}>导出备份</button></div>}
+      {sync.user && sync.message && sync.phase !== 'syncing' && <div className="sync-notice" role="status"><span>{sync.message}</span><button onClick={() => setDataModal(true)}>查看同步</button></div>}
+      {sync.conflicts > 0 && <div className="sync-notice" role="status"><span>同步遇到了同时修改，已保留编辑内容。你可以整理带“同步副本”的记录。</span><button onClick={() => sync.workspace.dismissConflicts()}>知道了</button></div>}
 
       {page === 'notes' && <>
         <div className="capture-grid"><Composer inputRef={composerRef} add={add} defaultCategory={category} /><DrawStage key="preview" {...drawProps} compact onExpand={() => navigate('draw')} /></div>
         <div className="notes-section"><div className="section-toolbar"><div className="section-title"><h2>想法收纳盒</h2><span>{String(filtered.length).padStart(2, '0')}</span></div><div className="filter-tabs" aria-label="记录类型">{([{ key: 'all', text: '全部记录' }, { key: 'ideas', text: '纯粹的灵感' }, { key: 'tasks', text: '想做的小事' }] as const).map(f => <button key={f.key} className={notesFilter === f.key ? 'selected' : ''} aria-pressed={notesFilter === f.key} onClick={() => setNotesFilter(f.key)}>{f.text}</button>)}</div></div>
         {(category !== '全部' || query) && <div className="active-filters">{category !== '全部' && <button onClick={() => setCategory('全部')}>{category}<X size={12} /></button>}{query && <span>搜索“{query}”的结果</span>}<button className="clear-filters" onClick={() => { setCategory('全部'); setQuery(''); setNotesFilter('all') }}>重置筛选</button></div>}
         {!store.welcomed && !query && <div className="welcome-hint"><Sparkles size={14} /><span>先放了几条示例陪你开始。随时编辑，或记下真正属于你的想法。</span><button className="icon-button" aria-label="关闭示例说明" onClick={() => setStore(s => ({ ...s, welcomed: true }))}><X size={13} /></button></div>}
-        <div className="notes-grid">{filtered.map(entry => <NoteCard key={entry.id} entry={entry} newId={newId} open={() => setEditor(entry.id)} toggleTask={() => toggleTask(entry)} complete={() => complete(entry)} restore={() => restore(entry)} />)}</div>
+        <div className="notes-grid">{filtered.map(entry => <NoteCard key={entry.id} entry={entry} newId={newId} open={() => setEditor(entry)} toggleTask={() => toggleTask(entry)} complete={() => complete(entry)} restore={() => restore(entry)} />)}</div>
         {!filtered.length && <div className="empty-state"><Feather size={27} /><h3>{query || category !== '全部' || notesFilter !== 'all' ? '这一格，还留着空白。' : '第一条想法，会是什么呢？'}</h3><p>{query || category !== '全部' || notesFilter !== 'all' ? '试试其他关键词，或换一个分类。' : '不需要一个大计划，一句话就可以开始。'}</p><button className="button secondary" onClick={() => { setQuery(''); setCategory('全部'); setNotesFilter('all'); composerRef.current?.focus() }}><Plus size={15} />记个新想法</button></div>}
         <div className="notes-end"><span /><Feather size={13} /><span>想法不用排队，想到就来。</span><span /></div></div>
       </>}
@@ -361,13 +372,13 @@ export default function App() {
         {eligible.length > 0 && <button className="text-button select-all" onClick={() => { const ids = new Set(eligible.map(e => e.id)); const allSelected = eligible.every(e => !excluded.includes(e.id)); setExcluded(s => allSelected ? [...new Set([...s, ...ids])] : s.filter(id => !ids.has(id))) }}><CheckCheck size={14} />{eligible.every(e => !excluded.includes(e.id)) ? '暂时全部取消' : '全部加入候选'}</button>}
         <button className="pool-add" onClick={() => { navigate('notes'); setTimeout(() => composerRef.current?.focus(), 0) }}><Plus size={15} />再添一件小事<ArrowUpRight size={14} /></button><div className="pool-footnote"><span>小提醒</span><p>重要又紧急的事，可以直接去做。<br />随机，留给那些让你犹豫的小选择。</p></div></aside></div>}
 
-      {page === 'done' && <div className="done-page"><div className="done-summary"><span className="done-summary-icon"><CheckCheck size={28} /></span><div><strong>{done.length}<span>件小事，已被你认真完成</span></strong><p>今天完成 {doneToday} 件。进度不必很快，走过就算数。</p></div></div><div className="section-toolbar"><div className="section-title"><h2>收集一点成就感</h2><span>{filtered.length}</span></div><span className="subtle">按记录时间排列</span></div><div className="notes-grid">{filtered.map(entry => <NoteCard key={entry.id} entry={entry} newId={null} open={() => setEditor(entry.id)} toggleTask={() => toggleTask(entry)} complete={() => complete(entry)} restore={() => restore(entry)} />)}</div>{!filtered.length && <div className="empty-state"><CircleCheck size={30} /><h3>{query ? '没有找到这条完成记录。' : '小小的成就，正在路上。'}</h3><p>{query ? '换个关键词试试。' : '去摇一个任务吧。完成后，它会被好好收在这里。'}</p><button className="button primary" onClick={() => navigate('draw')}><Dices size={16} />从一件小事开始</button></div>}</div>}
+      {page === 'done' && <div className="done-page"><div className="done-summary"><span className="done-summary-icon"><CheckCheck size={28} /></span><div><strong>{done.length}<span>件小事，已被你认真完成</span></strong><p>今天完成 {doneToday} 件。进度不必很快，走过就算数。</p></div></div><div className="section-toolbar"><div className="section-title"><h2>收集一点成就感</h2><span>{filtered.length}</span></div><span className="subtle">按记录时间排列</span></div><div className="notes-grid">{filtered.map(entry => <NoteCard key={entry.id} entry={entry} newId={null} open={() => setEditor(entry)} toggleTask={() => toggleTask(entry)} complete={() => complete(entry)} restore={() => restore(entry)} />)}</div>{!filtered.length && <div className="empty-state"><CircleCheck size={30} /><h3>{query ? '没有找到这条完成记录。' : '小小的成就，正在路上。'}</h3><p>{query ? '换个关键词试试。' : '去摇一个任务吧。完成后，它会被好好收在这里。'}</p><button className="button primary" onClick={() => navigate('draw')}><Dices size={16} />从一件小事开始</button></div>}</div>}
       <footer className="page-footer"><span>一点想法 · 一点随机 · 一点行动</span><button onClick={() => setHelpModal(true)}>慢慢来，也很好<ArrowUpRight size={12} /></button></footer>
     </main></div>
 
     <nav className="mobile-nav" aria-label="手机导航">{([{ id: 'notes', icon: Feather }, { id: 'draw', icon: Dices }, { id: 'done', icon: CircleCheck }] as const).map(item => <button key={item.id} className={page === item.id ? 'active' : ''} aria-current={page === item.id ? 'page' : undefined} onClick={() => navigate(item.id)}><item.icon size={20} /><span>{pageLabels[item.id]}</span></button>)}</nav>
     {selectedEntry && <EntryEditor key={selectedEntry.id} entry={selectedEntry} onClose={() => setEditor(null)} onSave={update} onDelete={remove} />}
-    {dataModal && <Modal title="你的想法，自己保管。" onClose={() => setDataModal(false)}><div className="data-content"><span className="data-illustration"><HardDrive size={29} /></span><p>记录会自动保存在当前浏览器里。再次打开，想法还在。切换设备或清理浏览器数据前，记得导出一份备份。</p>{storageError && <p className="danger" role="alert">{storageError}</p>}<div className="data-stats"><div><strong>{store.entries.length}</strong><span>条记录</span></div><div><strong>{pending.length}</strong><span>件待办</span></div><div><strong>{done.length}</strong><span>件已完成</span></div></div><button className="button primary full-width" onClick={exportData}><ArrowDownToLine size={16} />导出我的记录</button><button className="button secondary full-width" onClick={() => importRef.current?.click()}><Plus size={16} />从备份合并记录</button><input className="sr-only" type="file" accept="application/json,.json" ref={importRef} onChange={e => void importData(e.target.files?.[0])} />{store.entries.some(e => e.example) && <button className="text-button remove-examples" onClick={() => { const examples = store.entries.filter(e => e.example); setStore(s => ({ ...s, welcomed: true, entries: s.entries.filter(e => !e.example), activeId: examples.some(e => e.id === s.activeId) ? null : s.activeId })); notify('示例已清空，留给你自己的想法。', () => setStore(s => ({ ...s, entries: [...s.entries, ...examples.filter(e => !s.entries.some(item => item.id === e.id))] }))) }}><Trash2 size={14} />清空示例，重新开始</button>}</div></Modal>}
+    {dataModal && <Modal title="账号与数据" onClose={() => setDataModal(false)}><div className="data-content"><SyncPanel sync={sync} /><h3 className="backup-heading">给想法，多一份备份</h3><p>随时导出当前记录，也可以合并以前的备份。{sync.user ? '账号记录会在你的设备之间同步。' : '未登录时，记录只保存在当前浏览器。'}</p>{storageError && <p className="danger" role="alert">{storageError}</p>}<div className="data-stats"><div><strong>{store.entries.length}</strong><span>条记录</span></div><div><strong>{pending.length}</strong><span>件待办</span></div><div><strong>{done.length}</strong><span>件已完成</span></div></div><button className="button secondary full-width" onClick={exportData}><ArrowDownToLine size={16} />导出我的记录</button><button className="button secondary full-width" onClick={() => importRef.current?.click()}><Plus size={16} />从备份合并记录</button><input className="sr-only" type="file" accept="application/json,.json" ref={importRef} onChange={e => void importData(e.target.files?.[0])} />{store.entries.some(e => e.example) && <button className="text-button remove-examples" onClick={() => { const examples = store.entries.filter(e => e.example); setStore(s => ({ ...s, welcomed: true, entries: s.entries.filter(e => !e.example), activeId: examples.some(e => e.id === s.activeId) ? null : s.activeId })); notify('示例已清空，留给你自己的想法。', () => setStore(s => ({ ...s, entries: [...s.entries, ...examples.filter(e => !s.entries.some(item => item.id === e.id))] }))) }}><Trash2 size={14} />清空示例，重新开始</button>}<button className="text-button data-help" onClick={() => { setDataModal(false); setHelpModal(true) }}>查看使用说明<ArrowUpRight size={13} /></button></div></Modal>}
     {helpModal && <Modal title="让开始，变得轻一点。" onClose={() => setHelpModal(false)}><div className="help-content"><BrandMark /><p>“就这件”是一个装下灵感、也帮你开始的小空间。</p><div><span>01</span><p><strong>想到了，就先记下</strong>一句话也可以，不必等想法变完整。</p></div><div><span>02</span><p><strong>想做的事，放进任务池</strong>给它留一个合适的时间，轻轻勾选加入。</p></div><div><span>03</span><p><strong>不知道先做什么，就摇一个</strong>轻推卡片或点一下，今天从这一件开始。</p></div><footer><span><kbd>N</kbd>快速记录</span><span><kbd>⌘ / Ctrl K</kbd>搜索想法</span></footer></div></Modal>}
     {!selectedEntry && !dataModal && !helpModal && <ToastMessage toast={toast} close={closeToast} />}
   </div>

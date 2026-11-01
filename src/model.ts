@@ -36,18 +36,22 @@ export function exampleStore(): Store {
 export function isEntry(value: unknown): value is Entry {
   if (!value || typeof value !== 'object') return false
   const e = value as Record<string, unknown>
-  return typeof e.id === 'string' && typeof e.title === 'string' && typeof e.body === 'string'
-    && CATEGORIES.includes(e.category as Category) && typeof e.minutes === 'number' && Number.isFinite(e.minutes)
+  return typeof e.id === 'string' && e.id.length > 0 && e.id.length <= 200
+    && typeof e.title === 'string' && e.title.trim().length > 0 && e.title.length <= 120
+    && typeof e.body === 'string' && e.body.length <= 5000
+    && CATEGORIES.includes(e.category as Category) && typeof e.minutes === 'number' && Number.isFinite(e.minutes) && e.minutes > 0 && e.minutes <= 1440
     && typeof e.isTask === 'boolean' && typeof e.done === 'boolean'
-    && typeof e.createdAt === 'number' && Number.isFinite(e.createdAt)
+    && typeof e.createdAt === 'number' && Number.isFinite(e.createdAt) && e.createdAt >= 0 && e.createdAt <= 8640000000000000
+    && (e.completedAt === undefined || typeof e.completedAt === 'number' && Number.isFinite(e.completedAt) && e.completedAt >= 0 && e.completedAt <= 8640000000000000)
+    && (e.example === undefined || typeof e.example === 'boolean')
 }
 
-export function loadStore(): { store: Store; error: string | null } {
+export function loadStore(storage: Pick<Storage, 'getItem'> = localStorage): { store: Store; error: string | null } {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = storage.getItem(STORAGE_KEY)
     if (!raw) return { store: exampleStore(), error: null }
     const parsed = JSON.parse(raw) as Store
-    if (!Array.isArray(parsed.entries) || !parsed.entries.every(isEntry)) throw new Error('invalid')
+    if (!parsed || !Array.isArray(parsed.entries) || !parsed.entries.every(isEntry) || new Set(parsed.entries.map(e => e.id)).size !== parsed.entries.length) throw new Error('invalid')
     return { store: { entries: parsed.entries, activeId: parsed.activeId ?? null, welcomed: !!parsed.welcomed }, error: null }
   } catch {
     return { store: { entries: [], activeId: null, welcomed: true }, error: '暂时无法读取本地记录，请先检查浏览器的存储设置。' }

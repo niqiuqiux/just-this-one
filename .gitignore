@@ -4,3 +4,8 @@ dist/
 .DS_Store
 .playwright-mcp/
 *.tsbuildinfo
+.env
+.env.*
+!.env.example
+coverage/
+test-results/
